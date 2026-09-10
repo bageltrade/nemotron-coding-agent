@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nemotron Coding Agent
+Nemotron Coding Agent v1.1
 Single-file agentic coding agent for NVIDIA Nemotron 3 Super.
 Evaluation-mode prompt + tools + auto-repair + API retries.
 Pure Python 3.10+ stdlib. Linux aarch64 / x86_64.
@@ -21,21 +21,22 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+__version__ = "1.1.0"
+
 # ========================= CONFIG =========================
-API_KEY = os.environ.get(
-    "NVIDIA_API_KEY",
-    "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",
-)
+API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
 BASE_URL = os.environ.get(
     "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1/chat/completions"
-)
-MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+).strip()
+MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b").strip()
 TEMPERATURE = float(os.environ.get("NEMO_TEMPERATURE", "0.35"))
 MAX_TOKENS = int(os.environ.get("NEMO_MAX_TOKENS", "32768"))
 WORKSPACE = os.environ.get("NEMO_WORKSPACE", os.getcwd())
 MAX_STEPS = int(os.environ.get("NEMO_MAX_STEPS", "30"))
 API_RETRIES = int(os.environ.get("NEMO_API_RETRIES", "6"))
 API_RETRY_BASE = float(os.environ.get("NEMO_API_RETRY_BASE", "1.5"))
+# keep last N message pairs + system to control context growth
+MAX_HISTORY_MESSAGES = int(os.environ.get("NEMO_MAX_HISTORY", "24"))
 
 SYSTEM_PROMPT = """/think
 
@@ -96,12 +97,21 @@ def c(text: str, *styles: str) -> str:
     return "".join(styles) + text + C.RESET
 
 
+def require_api_key() -> None:
+    if not API_KEY:
+        print(c("ERROR: NVIDIA_API_KEY is not set.", C.RED, C.BOLD))
+        print(c("  export NVIDIA_API_KEY=\"nvapi-...\"", C.YELLOW))
+        sys.exit(2)
+
+
 # ========================= TOOLS =========================
-def tool_read_file(args: dict) -> str:
-    path = args.get("path", "")
+def _resolve(path: str) -> Path:
     p = Path(path)
-    if not p.is_absolute():
-        p = Path(WORKSPACE) / p
+    return p if p.is_absolute() else Path(WORKSPACE) / p
+
+
+def tool_read_file(args: dict) -> str:
+    p = _resolve(args.get("path", ""))
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
         if len(text) > 50000:
@@ -112,11 +122,8 @@ def tool_read_file(args: dict) -> str:
 
 
 def tool_write_file(args: dict) -> str:
-    path = args.get("path", "")
+    p = _resolve(args.get("path", ""))
     content = args.get("content", "")
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(WORKSPACE) / p
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -126,12 +133,9 @@ def tool_write_file(args: dict) -> str:
 
 
 def tool_edit_file(args: dict) -> str:
-    path = args.get("path", "")
+    p = _resolve(args.get("path", ""))
     old = args.get("old", "")
     new = args.get("new", "")
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(WORKSPACE) / p
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
         if old not in text:
@@ -145,10 +149,7 @@ def tool_edit_file(args: dict) -> str:
 
 
 def tool_list_dir(args: dict) -> str:
-    path = args.get("path", ".")
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(WORKSPACE) / p
+    p = _resolve(args.get("path", "."))
     try:
         entries = sorted(p.iterdir())
         lines = [f"{'dir ' if e.is_dir() else 'file'} {e.name}" for e in entries[:400]]
@@ -226,7 +227,6 @@ def llm_call(messages: List[Dict[str, str]]) -> str:
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8", errors="replace")[:400]
             last_err = f"[HTTP ERROR {e.code}] {err}"
-            # retry on overload / rate limit / transient
             if e.code in (408, 429, 500, 502, 503, 504) and attempt < API_RETRIES:
                 sleep_s = API_RETRY_BASE * (2 ** (attempt - 1))
                 print(c(f"  ↻ API {e.code}, retry {attempt}/{API_RETRIES} in {sleep_s:.1f}s", C.YELLOW))
@@ -273,8 +273,16 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def trim_history(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Keep system + last MAX_HISTORY_MESSAGES messages."""
+    if len(messages) <= MAX_HISTORY_MESSAGES + 1:
+        return messages
+    return [messages[0]] + messages[-MAX_HISTORY_MESSAGES:]
+
+
 # ========================= AGENT LOOP =========================
 def run_agent(task: str, max_steps: int = MAX_STEPS, verbose: bool = True) -> str:
+    require_api_key()
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -293,6 +301,7 @@ def run_agent(task: str, max_steps: int = MAX_STEPS, verbose: bool = True) -> st
     for step in range(1, max_steps + 1):
         if verbose:
             print(c(f"\n── step {step}/{max_steps} ──", C.DIM))
+        messages = trim_history(messages)
         reply = llm_call(messages)
         if verbose:
             print(c(reply[:900] + ("…" if len(reply) > 900 else ""), C.WHITE))
@@ -356,8 +365,8 @@ BANNER = r"""
  ╚═╝  ╚═══╝╚══════╝╚═╝     ╚═╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
 """
 
-HELP = """
-Single agentic coding agent (auto-repair + API retries).
+HELP = f"""
+Nemotron Coding Agent v{__version__}
 
   <task text>        run agent on task
   /help              show help
@@ -366,14 +375,16 @@ Single agentic coding agent (auto-repair + API retries).
   /tokens [value]    max_tokens
   /steps [value]     max agent steps
   /model             show model
+  /version           show version
   /quit              exit
 """
 
 
 def repl() -> None:
     global WORKSPACE, TEMPERATURE, MAX_TOKENS, MAX_STEPS
+    require_api_key()
     print(c(BANNER, C.MAGENTA, C.BOLD))
-    print(c("  Nemotron Coding Agent", C.CYAN, C.BOLD) + c("  ·  auto-repair  ·  API retries", C.DIM))
+    print(c(f"  Nemotron Coding Agent v{__version__}", C.CYAN, C.BOLD) + c("  ·  auto-repair  ·  API retries", C.DIM))
     print(c(f"  model      : {MODEL}", C.DIM))
     print(c(f"  workspace  : {WORKSPACE}", C.DIM))
     print(c(f"  temp={TEMPERATURE}  max_tokens={MAX_TOKENS}  max_steps={MAX_STEPS}  retries={API_RETRIES}", C.DIM))
@@ -393,6 +404,9 @@ def repl() -> None:
             break
         if line == "/help":
             print(c(HELP, C.CYAN))
+            continue
+        if line == "/version":
+            print(c(f"v{__version__}", C.CYAN))
             continue
         if line == "/model":
             print(c(f"model: {MODEL}", C.CYAN))
@@ -443,7 +457,8 @@ def repl() -> None:
 
 
 def self_test() -> bool:
-    print(c("=== SELF-TEST ===\n", C.BOLD))
+    require_api_key()
+    print(c(f"=== SELF-TEST v{__version__} ===\n", C.BOLD))
     test_path = str(Path(WORKSPACE) / "_agent_test_hello.txt")
     if os.path.exists(test_path):
         os.remove(test_path)
@@ -459,14 +474,27 @@ def self_test() -> bool:
 
 
 def main() -> None:
-    global WORKSPACE
-    parser = argparse.ArgumentParser(description="Nemotron Coding Agent")
+    global WORKSPACE, API_KEY
+    parser = argparse.ArgumentParser(description=f"Nemotron Coding Agent v{__version__}")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--task", type=str)
     parser.add_argument("--workspace", type=str)
+    parser.add_argument("--version", action="store_true")
     args = parser.parse_args()
+
+    if args.version:
+        print(__version__)
+        return
     if args.workspace:
         WORKSPACE = os.path.abspath(args.workspace)
+
+    # allow legacy embedded key only if env empty (local testing convenience)
+    if not API_KEY:
+        # optional local fallback file
+        env_file = Path.home() / ".config" / "nemotron_agent" / "key"
+        if env_file.is_file():
+            API_KEY = env_file.read_text().strip()
+
     if args.test:
         sys.exit(0 if self_test() else 1)
     if args.task:

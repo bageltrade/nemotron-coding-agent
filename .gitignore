@@ -2,5 +2,10 @@ __pycache__/
 *.pyc
 .env
 .venv/
+venv/
 *.egg-info/
 _agent_test_*.txt
+rat.py
+ddos.py
+*.log
+.DS_Store
