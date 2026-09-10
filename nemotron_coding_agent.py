@@ -227,22 +227,32 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     if "TOOL_CALL:" not in text:
         return None
     try:
-        m = re.search(
-            r"TOOL_CALL:\s*\n\s*name:\s*(\w+)\s*\n\s*args:\s*(\{.*?\})",
-            text, re.S,
-        )
-        if m:
-            return {"name": m.group(1), "args": json.loads(m.group(2))}
         after = text.split("TOOL_CALL:", 1)[1]
-        name_m = re.search(r"name:\s*(\w+)", after)
-        args_m = re.search(r"args:\s*(\{[^}]*\})", after, re.S)
-        if name_m and args_m:
-            return {"name": name_m.group(1), "args": json.loads(args_m.group(1))}
-        return None
+        name_m = re.search(r'name:\s*["\']?(\w+)["\']?', after)
+        if not name_m:
+            return None
+        name = name_m.group(1)
+        # find args: then first { ... matching }
+        idx = after.find("{")
+        if idx < 0:
+            return {"name": name, "args": {}}
+        depth = 0
+        end = None
+        for i, ch in enumerate(after[idx:], start=idx):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            return {"name": name, "args": {}}
+        raw = after[idx:end]
+        args = json.loads(raw)
+        return {"name": name, "args": args}
     except Exception:
         return None
-
-
 # ========================= AGENT LOOP =========================
 def run_agent(task: str, max_steps: int = MAX_STEPS, verbose: bool = True) -> str:
     messages: List[Dict[str, str]] = [
